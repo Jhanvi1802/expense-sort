@@ -1,300 +1,468 @@
-"""ExpenseSort (FastAPI): paste/upload transactions -> ML categorizes them ->
-dashboard with money in/out/net, a donut, category breakdown, a savings coach,
-an editable table, and CSV export. Run: python app.py -> http://localhost:8001
+"""ExpenseSort API — cloud, multi-user, India-first money app.
+
+Combines: statement ingest + ML-ish categorization, recurring/subscription
+detection, budgets, multi-month trends & anomalies, cash-flow forecast, India
+tax tagging, and a Splitwise-style group splitting engine (debt simplification,
+UPI settle links, auto-settle reconciliation).
+
+Run:  python app.py   ->  http://localhost:8001
 """
 import os
 import sys
 
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-from categorizer import categorize
-from parse import parse_transactions
+
+import json
+
+import budgets as budgets_svc
+import categories as cat_svc
+import forecast as forecast_svc
+import goals as goals_svc
+import health as health_svc
+import insights as insights_svc
+import recurring as recurring_svc
+import splitting as split_svc
+import tax as tax_svc
+import trends as trends_svc
+from db import init_db, query, execute
 from extract import extract_text
+from ingest import ingest_text, user_transactions
+from security import (hash_password, verify_password, create_token, current_user)
 
-app = FastAPI(title="ExpenseSort", version="3.0")
+app = FastAPI(title="ExpenseSort", version="4.0")
+init_db()
 
-EXAMPLE = ("Swiggy order 320\nUber ride 180\nAmazon purchase 1499\nElectricity bill 1200\n"
-           "BigBasket groceries 850\nNetflix subscription 199\nApollo pharmacy 430\n"
-           "Salary credited 60000\nOla cab 240\nJio recharge 299\nZomato dinner 540\n"
-           "Flipkart order 2299\nSpotify premium 129\nPetrol pump 2000")
+WEB = os.path.join(os.path.dirname(__file__), "web")
 
 
-class Req(BaseModel):
+# ---------------- schemas ----------------
+class Register(BaseModel):
+    email: str
+    name: str
+    password: str
+    upi_id: str = ""
+
+
+class Login(BaseModel):
+    email: str
+    password: str
+
+
+class TextReq(BaseModel):
     text: str = ""
 
 
-@app.post("/categorize")
-def categorize_endpoint(req: Req):
-    return categorize(parse_transactions(req.text))
+class BudgetReq(BaseModel):
+    category: str
+    limit_amount: float
 
 
-@app.post("/extract")
-async def extract_endpoint(file: UploadFile = File(...)):
+class GroupReq(BaseModel):
+    name: str
+    kind: str = "general"
+
+
+class MemberReq(BaseModel):
+    email: str
+    display_name: str = ""
+
+
+class ExpenseReq(BaseModel):
+    description: str
+    amount: float
+    paid_by: int
+    method: str = "equal"
+    values: dict = {}
+    participants: list = []
+    recurring: int = 0
+
+
+class SettleReq(BaseModel):
+    from_user: int
+    to_user: int
+    amount: float
+    note: str = ""
+
+
+# ---------------- auth ----------------
+@app.post("/api/register")
+def register(r: Register):
+    if query("SELECT 1 FROM users WHERE email=?", (r.email.lower(),), one=True):
+        # allow claiming a placeholder account (created via group invite)
+        existing = query("SELECT id, pw_hash FROM users WHERE email=?", (r.email.lower(),), one=True)
+        if existing["pw_hash"].startswith("pending$"):
+            execute("UPDATE users SET name=?, pw_hash=?, upi_id=? WHERE id=?",
+                    (r.name, hash_password(r.password), r.upi_id, existing["id"]))
+            return {"token": create_token(existing["id"]), "name": r.name}
+        raise HTTPException(400, "Email already registered")
+    uid = execute("""INSERT INTO users (email, name, upi_id, pw_hash, created_at)
+                     VALUES (?,?,?,?,datetime('now'))""",
+                  (r.email.lower(), r.name, r.upi_id, hash_password(r.password)))
+    return {"token": create_token(uid), "name": r.name}
+
+
+@app.post("/api/login")
+def login(r: Login):
+    u = query("SELECT id, name, pw_hash FROM users WHERE email=?", (r.email.lower(),), one=True)
+    if not u or not verify_password(r.password, u["pw_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+    return {"token": create_token(u["id"]), "name": u["name"]}
+
+
+def _hydrate(user):
+    """Parse JSON prefs/notif so the client gets objects, not strings."""
+    u = dict(user)
+    for k in ("prefs", "notif"):
+        try:
+            u[k] = json.loads(u.get(k) or "{}")
+        except Exception:
+            u[k] = {}
+    return u
+
+
+@app.get("/api/me")
+def me(user=Depends(current_user)):
+    return _hydrate(user)
+
+
+class Profile(BaseModel):
+    name: str = None
+    upi_id: str = None
+    phone: str = None
+    photo: str = None
+    monthly_income: float = None
+    prefs: dict = None
+    notif: dict = None
+    tax_regime: str = None
+
+
+@app.post("/api/me")
+def update_me(p: Profile, user=Depends(current_user)):
+    fields, vals = [], []
+    mapping = {"name": p.name, "upi_id": p.upi_id, "phone": p.phone, "photo": p.photo,
+               "monthly_income": p.monthly_income, "tax_regime": p.tax_regime,
+               "prefs": json.dumps(p.prefs) if p.prefs is not None else None,
+               "notif": json.dumps(p.notif) if p.notif is not None else None}
+    for col, val in mapping.items():
+        if val is not None:
+            fields.append(f"{col}=?")
+            vals.append(val)
+    if fields:
+        vals.append(user["id"])
+        execute(f"UPDATE users SET {','.join(fields)} WHERE id=?", vals)
+    return _hydrate(query("""SELECT id,email,name,upi_id,phone,photo,monthly_income,
+                             prefs,notif,tax_regime,onboarded FROM users WHERE id=?""",
+                          (user["id"],), one=True))
+
+
+@app.post("/api/onboard")
+def onboard(user=Depends(current_user)):
+    execute("UPDATE users SET onboarded=1 WHERE id=?", (user["id"],))
+    return {"ok": True}
+
+
+class PwReq(BaseModel):
+    current: str
+    new: str
+
+
+@app.post("/api/password")
+def change_password(r: PwReq, user=Depends(current_user)):
+    row = query("SELECT pw_hash FROM users WHERE id=?", (user["id"],), one=True)
+    if not verify_password(r.current, row["pw_hash"]):
+        raise HTTPException(400, "Current password is incorrect")
+    execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_password(r.new), user["id"]))
+    return {"ok": True}
+
+
+@app.delete("/api/account")
+def delete_account(user=Depends(current_user)):
+    execute("DELETE FROM users WHERE id=?", (user["id"],))   # cascades to all user data
+    return {"ok": True}
+
+
+# ---------------- ingest & transactions ----------------
+@app.post("/api/ingest")
+def ingest(r: TextReq, user=Depends(current_user)):
+    res = ingest_text(user["id"], r.text, source="paste")
+    recurring_svc.detect(user["id"])       # refresh recurring flags
+    return res
+
+
+@app.post("/api/extract")
+async def extract(file: UploadFile = File(...), user=Depends(current_user)):
     data = await file.read()
+    if len(data) > 8 * 1024 * 1024:
+        raise HTTPException(413, "File too large (max 8 MB)")
     try:
-        return {"text": extract_text(file.filename, data)}
+        text = extract_text(file.filename, data)
     except Exception as e:
-        return {"text": "", "error": f"Could not read {file.filename}: {e}"}
+        raise HTTPException(400, f"Could not read {file.filename}: {e}")
+    res = ingest_text(user["id"], text, source=file.filename)
+    recurring_svc.detect(user["id"])
+    return res
 
 
+@app.get("/api/transactions")
+def transactions(month: str = None, q: str = None, page: int = 1, size: int = 20,
+                 user=Depends(current_user)):
+    where = "WHERE user_id=?"
+    params = [user["id"]]
+    if month:
+        where += " AND month=?"; params.append(month)
+    if q:
+        where += " AND (description LIKE ? OR category LIKE ?)"
+        params += [f"%{q}%", f"%{q}%"]
+    total = query(f"SELECT COUNT(*) c FROM transactions {where}", params, one=True)["c"]
+    page = max(1, page)
+    rows = query(f"SELECT * FROM transactions {where} ORDER BY txn_date DESC, id DESC LIMIT ? OFFSET ?",
+                 params + [size, (page - 1) * size])
+    return {"rows": rows, "total": total, "page": page, "size": size,
+            "pages": max(1, (total + size - 1) // size)}
+
+
+class RecatReq(BaseModel):
+    id: int
+    category: str
+
+
+@app.post("/api/transactions/recategorize")
+def recategorize(r: RecatReq, user=Depends(current_user)):
+    execute("UPDATE transactions SET category=? WHERE id=? AND user_id=?",
+            (r.category, r.id, user["id"]))
+    return {"ok": True}
+
+
+@app.delete("/api/data")
+def wipe(user=Depends(current_user)):
+    execute("DELETE FROM transactions WHERE user_id=?", (user["id"],))
+    execute("DELETE FROM statements WHERE user_id=?", (user["id"],))
+    return {"ok": True}
+
+
+# ---------------- dashboard / analytics ----------------
+@app.get("/api/dashboard")
+def dashboard(month: str = None, user=Depends(current_user)):
+    return insights_svc.dashboard(user["id"], month)
+
+
+@app.get("/api/recurring")
+def recurring(user=Depends(current_user)):
+    return recurring_svc.detect(user["id"])
+
+
+@app.get("/api/budgets")
+def get_budgets(month: str = None, user=Depends(current_user)):
+    return budgets_svc.status(user["id"], month)
+
+
+@app.post("/api/budgets")
+def set_budget(b: BudgetReq, user=Depends(current_user)):
+    budgets_svc.set_budget(user["id"], b.category, b.limit_amount)
+    return {"ok": True}
+
+
+@app.delete("/api/budgets/{category}")
+def del_budget(category: str, user=Depends(current_user)):
+    budgets_svc.delete_budget(user["id"], category)
+    return {"ok": True}
+
+
+@app.get("/api/trends")
+def get_trends(user=Depends(current_user)):
+    return {"monthly": trends_svc.monthly(user["id"]),
+            "by_category": trends_svc.category_trend(user["id"]),
+            "anomalies": trends_svc.anomalies(user["id"])}
+
+
+@app.get("/api/forecast")
+def get_forecast(user=Depends(current_user)):
+    return forecast_svc.forecast(user["id"], user.get("monthly_income") or 0)
+
+
+@app.get("/api/health")
+def get_health(user=Depends(current_user)):
+    return health_svc.score(user["id"])
+
+
+# ---------------- goals ----------------
+class GoalReq(BaseModel):
+    name: str
+    target: float
+    saved: float = 0
+
+
+class ContribReq(BaseModel):
+    amount: float
+
+
+@app.get("/api/goals")
+def get_goals(user=Depends(current_user)):
+    return {"goals": goals_svc.list_goals(user["id"])}
+
+
+@app.post("/api/goals")
+def new_goal(g: GoalReq, user=Depends(current_user)):
+    return {"id": goals_svc.create(user["id"], g.name, g.target, g.saved)}
+
+
+@app.post("/api/goals/{gid}/contribute")
+def contribute_goal(gid: int, c: ContribReq, user=Depends(current_user)):
+    goals_svc.contribute(user["id"], gid, c.amount)
+    return {"ok": True}
+
+
+@app.delete("/api/goals/{gid}")
+def del_goal(gid: int, user=Depends(current_user)):
+    goals_svc.delete(user["id"], gid)
+    return {"ok": True}
+
+
+# ---------------- categories ----------------
+class CatReq(BaseModel):
+    name: str
+    color: str = "#94a3b8"
+    icon: str = "📦"
+
+
+@app.get("/api/categories")
+def get_categories(user=Depends(current_user)):
+    return {"categories": cat_svc.list_categories(user["id"])}
+
+
+@app.post("/api/categories")
+def add_category(c: CatReq, user=Depends(current_user)):
+    cat_svc.add(user["id"], c.name, c.color, c.icon)
+    return {"ok": True}
+
+
+@app.delete("/api/categories/{name}")
+def del_category(name: str, user=Depends(current_user)):
+    cat_svc.delete(user["id"], name)
+    return {"ok": True}
+
+
+# ---------------- tax ----------------
+class TaxEntryReq(BaseModel):
+    section: str
+    label: str
+    amount: float
+
+
+class RegimeReq(BaseModel):
+    regime: str
+
+
+@app.get("/api/tax")
+def get_tax(user=Depends(current_user)):
+    rows = query("SELECT amount, tax_section FROM transactions WHERE user_id=? AND tax_section IS NOT NULL",
+                 (user["id"],))
+    manual = query("SELECT id, section, label, amount FROM tax_entries WHERE user_id=?", (user["id"],))
+    return tax_svc.summarize(rows, manual, user.get("tax_regime") or "new")
+
+
+@app.post("/api/tax/entry")
+def add_tax_entry(e: TaxEntryReq, user=Depends(current_user)):
+    return {"id": execute("INSERT INTO tax_entries (user_id, section, label, amount) VALUES (?,?,?,?)",
+                          (user["id"], e.section, e.label, e.amount))}
+
+
+@app.delete("/api/tax/entry/{eid}")
+def del_tax_entry(eid: int, user=Depends(current_user)):
+    execute("DELETE FROM tax_entries WHERE id=? AND user_id=?", (eid, user["id"]))
+    return {"ok": True}
+
+
+@app.post("/api/tax/regime")
+def set_regime(r: RegimeReq, user=Depends(current_user)):
+    execute("UPDATE users SET tax_regime=? WHERE id=?", (r.regime, user["id"]))
+    return {"ok": True}
+
+
+# ---------------- splitting ----------------
+def _require_member(gid, user):
+    if not split_svc.is_member(gid, user["id"]):
+        raise HTTPException(403, "Not a member of this group")
+
+
+@app.get("/api/groups")
+def groups(user=Depends(current_user)):
+    return {"groups": split_svc.user_groups(user["id"])}
+
+
+@app.post("/api/groups")
+def new_group(g: GroupReq, user=Depends(current_user)):
+    gid = split_svc.create_group(user["id"], g.name, g.kind)
+    return {"id": gid}
+
+
+@app.get("/api/groups/{gid}")
+def group_detail(gid: int, user=Depends(current_user)):
+    _require_member(gid, user)
+    return {
+        "members": split_svc.members(gid),
+        "expenses": split_svc.expenses(gid),
+        "balances": split_svc.balances(gid),
+        "simplified": split_svc.simplify(gid),
+    }
+
+
+@app.post("/api/groups/{gid}/members")
+def add_member(gid: int, m: MemberReq, user=Depends(current_user)):
+    _require_member(gid, user)
+    return split_svc.add_member(gid, m.email, m.display_name or None)
+
+
+@app.post("/api/groups/{gid}/expenses")
+def add_expense(gid: int, e: ExpenseReq, user=Depends(current_user)):
+    _require_member(gid, user)
+    return split_svc.add_expense(gid, e.description, e.amount, e.paid_by, e.method,
+                                 e.values, e.participants or None, e.recurring)
+
+
+@app.post("/api/groups/{gid}/settle")
+def settle(gid: int, s: SettleReq, user=Depends(current_user)):
+    _require_member(gid, user)
+    split_svc.settle(gid, s.from_user, s.to_user, s.amount, s.note or None)
+    link = split_svc.upi_link(s.to_user, s.amount)
+    return {"ok": True, "upi_link": link}
+
+
+@app.get("/api/groups/{gid}/upi")
+def upi(gid: int, to_user: int, amount: float, user=Depends(current_user)):
+    _require_member(gid, user)
+    return {"upi_link": split_svc.upi_link(to_user, amount)}
+
+
+@app.get("/api/reconcile")
+def reconcile(user=Depends(current_user)):
+    return {"suggestions": split_svc.reconcile_suggestions(user["id"])}
+
+
+# ---------------- frontend ----------------
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return PAGE.replace("%EX%", EXAMPLE.replace("\n", "\\n"))
+    return FileResponse(os.path.join(WEB, "index.html"))
 
 
-PAGE = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ExpenseSort — see where your money really goes</title>
-<style>
-  :root{
-    --bg:#f2f6f5; --card:#ffffff; --ink:#0f2a27; --muted:#6b8079; --line:#e4ede9;
-    --teal:#0f766e; --teal2:#12b3a6; --mint:#e7f7f1;
-    --green:#12a150; --red:#e5484d; --amber:#d97706;
-    --shadow:0 12px 34px rgba(6,78,72,.10); --shadow-sm:0 4px 14px rgba(6,78,72,.07);
-  }
-  *{box-sizing:border-box;margin:0;padding:0;}
-  body{font-family:"Inter","Segoe UI",system-ui,Arial,sans-serif;background:var(--bg);color:var(--ink);line-height:1.5;}
-  .hero{background:radial-gradient(120% 140% at 0% 0%,#14b8a6 0%,#0f766e 55%,#0b5c55 100%);color:#fff;
-        padding:26px 24px 64px;position:relative;overflow:hidden;}
-  .hero:after{content:"";position:absolute;right:-60px;top:-60px;width:240px;height:240px;border-radius:50%;
-              background:rgba(255,255,255,.08);}
-  .hero .in{max-width:1040px;margin:0 auto;position:relative;z-index:1;}
-  .brand{display:flex;align-items:center;gap:11px;font-weight:800;font-size:23px;letter-spacing:.2px;}
-  .logo{width:34px;height:34px;border-radius:10px;background:#fff;color:var(--teal);display:grid;place-items:center;font-weight:900;font-size:18px;box-shadow:0 4px 10px rgba(0,0,0,.15);}
-  .hero p{opacity:.94;margin-top:10px;font-size:14.5px;max-width:600px;}
-  .wrap{max-width:1040px;margin:-46px auto 48px;padding:0 18px;position:relative;z-index:2;}
-  .panel{background:var(--card);border:1px solid var(--line);border-radius:20px;box-shadow:var(--shadow);padding:22px;}
-  .fld{display:block;font-size:13px;font-weight:700;color:var(--teal);margin-bottom:8px;}
-  .uploadbar{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap;}
-  .filebtn{font-size:12.5px;font-weight:700;color:#fff;background:var(--teal);border-radius:10px;padding:8px 13px;cursor:pointer;box-shadow:var(--shadow-sm);}
-  .filebtn:hover{background:var(--teal2);}
-  .fname{font-size:12px;color:var(--muted);} input[type=file]{display:none;}
-  textarea{width:100%;height:140px;padding:13px 15px;border:1.5px solid var(--line);border-radius:14px;font-size:13px;
-           resize:vertical;font-family:ui-monospace,Consolas,monospace;color:var(--ink);background:#fbfefc;}
-  textarea:focus{outline:none;border-color:var(--teal2);box-shadow:0 0 0 4px rgba(18,179,166,.15);}
-  .row{display:flex;align-items:center;gap:14px;margin-top:14px;flex-wrap:wrap;}
-  .primary{background:var(--teal);color:#fff;border:0;border-radius:13px;padding:13px 28px;font-size:15px;font-weight:800;cursor:pointer;box-shadow:0 8px 18px rgba(15,118,110,.32);}
-  .primary:hover{background:var(--teal2);} .primary:disabled{opacity:.55;box-shadow:none;}
-  .link{background:none;border:0;color:var(--teal);font-weight:700;cursor:pointer;font-size:13.5px;padding:6px;}
-  .link:hover{text-decoration:underline;}
-  #out{margin-top:6px;}
+@app.get("/app.js")
+def appjs():
+    return FileResponse(os.path.join(WEB, "app.js"), media_type="application/javascript")
 
-  .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:20px 0;}
-  @media(max-width:640px){.kpis{grid-template-columns:1fr;}}
-  .kpi{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:var(--shadow-sm);
-       display:flex;align-items:center;gap:14px;position:relative;overflow:hidden;}
-  .kpi:before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;}
-  .kpi.in:before{background:var(--green);} .kpi.out:before{background:var(--red);} .kpi.net:before{background:var(--teal);}
-  .kpi .badge{width:46px;height:46px;border-radius:13px;display:grid;place-items:center;font-size:22px;flex:none;}
-  .kpi.in .badge{background:#e6f7ee;} .kpi.out .badge{background:#fdeaea;} .kpi.net .badge{background:var(--mint);}
-  .kpi .lbl{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;font-weight:700;}
-  .kpi .val{font-size:25px;font-weight:800;margin-top:2px;}
 
-  .dash{display:grid;grid-template-columns:300px 1fr;gap:18px;}
-  @media(max-width:780px){.dash{grid-template-columns:1fr;}}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px 20px;box-shadow:var(--shadow-sm);}
-  h3{font-size:12px;text-transform:uppercase;letter-spacing:.7px;margin:0 0 12px;color:var(--muted);font-weight:800;}
-  .donutwrap{display:flex;flex-direction:column;align-items:center;}
-  .legend{width:100%;margin-top:10px;}
-  .lg{display:flex;align-items:center;gap:9px;font-size:12.5px;margin:6px 0;}
-  .lg .em{font-size:14px;} .lg .amt{margin-left:auto;font-weight:700;font-variant-numeric:tabular-nums;}
-  .catrow{display:grid;grid-template-columns:170px 1fr 92px;gap:12px;align-items:center;margin:11px 0;font-size:13px;}
-  .cname{display:flex;align-items:center;gap:7px;font-weight:600;}
-  .catbar{height:12px;border-radius:7px;background:#eef4f1;overflow:hidden;} .catbar>div{height:100%;border-radius:7px;}
-  .amt{text-align:right;font-variant-numeric:tabular-nums;font-weight:700;}
-  .amt .pct{display:block;color:var(--muted);font-weight:500;font-size:11px;}
-  .insights{margin-top:16px;} .insights ul{list-style:none;} .insights li{font-size:13.5px;margin:8px 0;padding-left:22px;position:relative;}
-  .insights li:before{content:"•";position:absolute;left:6px;color:var(--teal2);font-weight:900;}
-
-  .coach{margin-top:18px;border-radius:20px;padding:20px 22px;color:#fff;
-         background:radial-gradient(120% 160% at 100% 0%,#16a34a 0%,#0f766e 70%);box-shadow:var(--shadow);}
-  .coachhead{display:flex;align-items:center;gap:14px;margin-bottom:12px;}
-  .coachicon{width:52px;height:52px;border-radius:14px;background:rgba(255,255,255,.2);display:grid;place-items:center;font-size:26px;flex:none;}
-  .coachhead .ct{font-size:12.5px;opacity:.9;text-transform:uppercase;letter-spacing:.6px;font-weight:700;}
-  .coachhead .camt{font-size:30px;font-weight:800;line-height:1.1;}
-  .clist{list-style:none;} .clist li{display:flex;gap:10px;align-items:flex-start;font-size:13.5px;margin:9px 0;}
-  .clist li .ci{flex:none;}
-  .coachnote{font-size:12px;background:rgba(255,255,255,.16);border-radius:9px;padding:7px 11px;margin-top:12px;}
-
-  .tblcard{margin-top:18px;}
-  .tablehead{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;}
-  .dl{background:var(--mint);color:var(--teal);border:0;border-radius:10px;padding:8px 13px;font-size:12.5px;font-weight:700;cursor:pointer;}
-  .dl:hover{background:#d6f2e4;}
-  table{width:100%;border-collapse:collapse;font-size:13px;}
-  th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);}
-  tbody tr:hover{background:#f7fbf9;}
-  td.r,th.r{text-align:right;font-variant-numeric:tabular-nums;}
-  .tdot{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:7px;vertical-align:middle;}
-  select{border:1px solid var(--line);border-radius:9px;padding:5px 7px;font-size:12.5px;background:#fff;color:var(--ink);}
-  .foot{text-align:center;color:var(--muted);font-size:12.5px;margin-top:24px;}
-  .hint{font-size:13px;color:var(--muted);margin-top:8px;}
-</style></head>
-<body>
-  <div class="hero"><div class="in">
-    <div class="brand"><span class="logo">₹</span> ExpenseSort</div>
-    <p>Upload your bank statement (or paste transactions). See where your money really goes — income vs spending vs investments — and exactly where you can save.</p>
-  </div></div>
-
-  <div class="wrap">
-    <div class="panel">
-      <label class="fld">Upload your bank statement, or paste transactions (one per line, or CSV)</label>
-      <div class="uploadbar">
-        <label class="filebtn" for="file">&#8593; Upload statement PDF / CSV / TXT</label>
-        <input id="file" type="file" accept=".pdf,.csv,.txt" onchange="upload()">
-        <span class="fname" id="fname"></span>
-      </div>
-      <textarea id="tx" placeholder="Swiggy order 320&#10;Salary credited 60000&#10;Amazon purchase 1499"></textarea>
-      <div class="row">
-        <button class="primary" id="go" onclick="run()">Analyze my money</button>
-        <button class="link" onclick="loadExample()">Try an example</button>
-        <button class="link" onclick="clearAll()">Clear</button>
-      </div>
-    </div>
-    <div id="out"></div>
-    <div class="foot">Runs locally &middot; income vs spend from your balance &middot; edit any category and everything updates live</div>
-  </div>
-
-<script>
-const EX="%EX%";
-const COLORS={"Food & Dining":"#ef4444","Groceries":"#16a34a","Transport":"#3b82f6","Shopping":"#a855f7",
-  "Bills & Utilities":"#f59e0b","Entertainment":"#ec4899","Health":"#06b6d4","Income":"#0d9488",
-  "Transfers":"#64748b","Others":"#94a3b8","Investments":"#0ea5e9","Insurance":"#f97316",
-  "Rent":"#84cc16","Bank Charges":"#78716c"};
-const ICONS={"Food & Dining":"🍔","Groceries":"🛒","Transport":"🚗","Shopping":"🛍️","Bills & Utilities":"💡",
-  "Entertainment":"🎬","Health":"🏥","Rent":"🏠","Insurance":"🛡️","Investments":"📈","Transfers":"🔁",
-  "Bank Charges":"🏦","Income":"💰","Others":"📦"};
-const NONSPEND=["Investments","Transfers","Bank Charges"];
-const DISCRETIONARY=["Food & Dining","Shopping","Entertainment"];
-const SUBS=["netflix","spotify","hotstar","prime","youtube","disney","apple","googleplay","gym"];
-let STATE={rows:[],categories:[]};
-function col(c){return COLORS[c]||"#94a3b8";}
-function ico(c){return ICONS[c]||"📦";}
-function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
-function inr(n){return '₹'+Math.round(Number(n)).toLocaleString('en-IN');}
-function loadExample(){document.getElementById('tx').value=EX;run();}
-function clearAll(){document.getElementById('tx').value='';document.getElementById('fname').textContent='';document.getElementById('out').innerHTML='';STATE={rows:[],categories:[]};}
-
-async function upload(){
-  const inp=document.getElementById('file'); if(!inp.files.length) return;
-  const fd=new FormData(); fd.append('file',inp.files[0]);
-  document.getElementById('fname').textContent='reading '+inp.files[0].name+'...';
-  try{const r=await fetch('/extract',{method:'POST',body:fd});const d=await r.json();
-    document.getElementById('tx').value=d.text||'';document.getElementById('fname').textContent=d.error?d.error:('loaded '+inp.files[0].name);
-  }catch(e){document.getElementById('fname').textContent='could not read file';}
-}
-async function run(){
-  const text=document.getElementById('tx').value.trim();const out=document.getElementById('out');
-  if(!text){out.innerHTML='<p class="hint">Paste some transactions or click <b>Try an example</b>.</p>';return;}
-  const b=document.getElementById('go');b.disabled=true;b.textContent='Analyzing...';
-  try{const r=await fetch('/categorize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
-    const d=await r.json(); STATE.rows=d.rows; STATE.categories=d.categories_list; render();
-  }catch(e){out.innerHTML='<p class="hint">Error: '+esc(e)+'</p>';}
-  b.disabled=false;b.textContent='Analyze my money';
-}
-function isIncome(r){return r.direction==='credit' || (!r.direction && r.category==='Income');}
-function aggregate(){
-  let income=0,expense=0,by={};
-  STATE.rows.forEach(r=>{const a=Number(r.amount)||0;
-    if(isIncome(r)){income+=a;}
-    else{expense+=a;by[r.category]=(by[r.category]||0)+a;}});
-  const cats=Object.entries(by).sort((x,y)=>y[1]-x[1]);
-  return {income,expense,net:income-expense,cats};
-}
-function catSum(agg,name){return agg.cats.filter(([c])=>c===name).reduce((s,[,a])=>s+a,0);}
-function donut(cats,expense){
-  const R=68,C=2*Math.PI*R;let acc=0;
-  const segs=cats.map(([c,a])=>{const seg=expense?a/expense*C:0;const s=`<circle cx="90" cy="90" r="${R}" fill="none" stroke="${col(c)}" stroke-width="24" stroke-dasharray="${seg} ${C-seg}" stroke-dashoffset="${-acc}" transform="rotate(-90 90 90)"/>`;acc+=seg;return s;}).join('');
-  return `<svg width="180" height="180">${segs}<circle cx="90" cy="90" r="55" fill="#fff"/>
-    <text x="90" y="82" text-anchor="middle" font-size="11" fill="#6b8079">Money out</text>
-    <text x="90" y="106" text-anchor="middle" font-size="21" font-weight="800" fill="#0f766e">${inr(expense)}</text></svg>`;
-}
-function insights(agg){
-  const t=[];
-  const invest=catSum(agg,"Investments"),transfers=catSum(agg,"Transfers"),charges=catSum(agg,"Bank Charges");
-  const spending=Math.max(0, agg.expense-invest-transfers-charges);
-  if(invest+transfers+charges>0){let p=[];
-    if(invest>0)p.push(`${inr(invest)} to investments`); if(transfers>0)p.push(`${inr(transfers)} to transfers`); if(charges>0)p.push(`${inr(charges)} to bank charges`);
-    t.push(`Of ${inr(agg.expense)} that left your account, ${p.join(', ')} — your <b>actual spending was about ${inr(spending)}</b>.`);}
-  const spendCats=agg.cats.filter(([c])=>!NONSPEND.includes(c));
-  if(spendCats.length){const [c,a]=spendCats[0];const p=spending?Math.round(a/spending*100):0;t.push(`Your biggest actual spend is <b>${esc(c)}</b>: ${inr(a)} (${p}% of spending).`);}
-  if(agg.income>0){const rate=Math.round(agg.net/agg.income*100);
-    t.push(agg.net>=0?`Money in ${inr(agg.income)} vs out ${inr(agg.expense)} — net <b>${inr(agg.net)}</b> (${rate}% saved).`:`You spent ${inr(-agg.net)} more than came in this period.`);}
-  const ex=STATE.rows.filter(r=>!isIncome(r));
-  if(ex.length){const big=ex.reduce((m,r)=>Number(r.amount)>Number(m.amount)?r:m);t.push(`Largest single outflow: <b>${esc(big.description.slice(0,40))}</b> (${inr(big.amount)}).`);}
-  return t;
-}
-function savingsAdvice(agg){
-  const invest=catSum(agg,"Investments"),transfers=catSum(agg,"Transfers"),charges=catSum(agg,"Bank Charges");
-  const spending=Math.max(0,agg.expense-invest-transfers-charges);
-  const disc=agg.cats.filter(([c])=>DISCRETIONARY.includes(c)).reduce((s,[,a])=>s+a,0);
-  let subTotal=0,subN=0;
-  STATE.rows.forEach(r=>{const d=(r.description||'').toLowerCase().replace(/[^a-z0-9]/g,'');
-    if(!isIncome(r)&&SUBS.some(s=>d.includes(s))){subTotal+=Number(r.amount)||0;subN++;}});
-  const foodRows=STATE.rows.filter(r=>!isIncome(r)&&r.category==='Food & Dining');
-  const foodSum=foodRows.reduce((s,r)=>s+(Number(r.amount)||0),0);
-  const recs=[]; let potential=0;
-  if(charges>0){recs.push(`Bank charges of <b>${inr(charges)}</b> are fully avoidable — keep the required minimum balance and this drops to zero.`);potential+=charges;}
-  if(subTotal>0){const half=Math.round(subTotal*0.5);recs.push(`You pay <b>${inr(subTotal)}</b> across ${subN} subscription charge(s). Cancel the ones you rarely use — even half is ~${inr(half)} back.`);potential+=half;}
-  if(foodRows.length>=4){const cut=Math.round(foodSum*0.3);recs.push(`You spent <b>${inr(foodSum)}</b> on ${foodRows.length} food/eating-out orders. Cooking a few more meals could save ~${inr(cut)}.`);potential+=cut;}
-  else if(disc>0){const cut=Math.round(disc*0.2);recs.push(`Trim discretionary spend (${inr(disc)} on food/shopping/entertainment) by 20% to save ~${inr(cut)}.`);potential+=cut;}
-  const spendCats=agg.cats.filter(([c])=>!NONSPEND.includes(c)&&c!=='Others');
-  if(spendCats.length){const [c,a]=spendCats[0];if(spending&&a/spending>=0.3)recs.push(`<b>${esc(c)}</b> is your biggest real expense at ${Math.round(a/spending*100)}% of spending (${inr(a)}) — the first place to look at cutting.`);}
-  if(agg.income>0){const rate=Math.round(agg.net/agg.income*100);
-    recs.push(rate>=20?`Good news: your savings rate is <b>${rate}%</b> (healthy is 20%+).${invest>0?' And '+inr(invest)+' is going into investments — keep it up.':''}`
-                      :`Your savings rate is <b>${rate}%</b>. Acting on the points above can push it past a healthy 20%.`);}
-  return {potential:Math.round(potential),recs};
-}
-function render(){
-  const agg=aggregate();const maxCat=Math.max(1,...agg.cats.map(c=>c[1]));
-  const netColor=agg.net>=0?'var(--green)':'var(--red)';
-  const adv=savingsAdvice(agg);
-  const legend=agg.cats.map(([c,a])=>`<div class="lg"><span class="em">${ico(c)}</span>${esc(c)}<span class="amt" style="font-weight:700">${inr(a)}</span></div>`).join('');
-  const breakdown=agg.cats.map(([c,a])=>{const p=agg.expense?Math.round(a/agg.expense*100):0;
-    return `<div class="catrow"><span class="cname">${ico(c)} ${esc(c)}</span>
-      <div class="catbar"><div style="width:${Math.round(a/maxCat*100)}%;background:${col(c)}"></div></div>
-      <span class="amt">${inr(a)}<span class="pct">${p}%</span></span></div>`;}).join('');
-  const opts=c=>STATE.categories.map(x=>`<option ${x===c?'selected':''}>${esc(x)}</option>`).join('');
-  const rows=STATE.rows.map((r,i)=>`<tr><td>${esc(r.description)}</td>
-     <td><span class="tdot" style="background:${col(r.category)}"></span><select onchange="recat(${i},this.value)">${opts(r.category)}</select></td>
-     <td class="r">${inr(r.amount)}</td></tr>`).join('');
-  const tips=insights(agg).map(t=>`<li>${t}</li>`).join('');
-  const recs=adv.recs.map(r=>`<li><span class="ci">✅</span><span>${r}</span></li>`).join('');
-  document.getElementById('out').innerHTML=`
-    <div class="kpis">
-      <div class="kpi in"><div class="badge">⬇️</div><div><div class="lbl">Money In</div><div class="val" style="color:var(--green)">${inr(agg.income)}</div></div></div>
-      <div class="kpi out"><div class="badge">⬆️</div><div><div class="lbl">Money Out</div><div class="val" style="color:var(--red)">${inr(agg.expense)}</div></div></div>
-      <div class="kpi net"><div class="badge">💼</div><div><div class="lbl">Net</div><div class="val" style="color:${netColor}">${inr(agg.net)}</div></div></div>
-    </div>
-    <div class="dash">
-      <div class="card donutwrap"><h3>Where money went</h3>${donut(agg.cats,agg.expense)}<div class="legend">${legend}</div></div>
-      <div class="card"><h3>Outflow by category</h3>${breakdown||'<span class="hint">No outflows found.</span>'}
-        <div class="insights"><h3>Insights</h3><ul>${tips}</ul></div></div>
-    </div>
-    <div class="coach">
-      <div class="coachhead"><span class="coachicon">💰</span><div><div class="ct">You could save about</div><div class="camt">${inr(adv.potential)}</div><div class="ct" style="opacity:.85">this period</div></div></div>
-      <ul class="clist">${recs}</ul>
-      <div class="coachnote">Estimates from your transactions. Cut the avoidable items first (charges, unused subscriptions), then trim discretionary spending.</div>
-    </div>
-    <div class="card tblcard">
-      <div class="tablehead"><h3 style="margin:0">Transactions &nbsp;<span style="color:var(--muted);font-weight:500;text-transform:none;letter-spacing:0">(change a category if it's wrong)</span></h3>
-        <button class="dl" onclick="downloadCSV()">&#8681; Download CSV</button></div>
-      <table><thead><tr><th>Description</th><th>Category</th><th class="r">Amount</th></tr></thead><tbody>${rows}</tbody></table>
-    </div>`;
-}
-function recat(i,val){STATE.rows[i].category=val;render();}
-function downloadCSV(){
-  const lines=[["description","category","amount"]].concat(STATE.rows.map(r=>[`"${(r.description||'').replace(/"/g,'""')}"`,r.category,r.amount]));
-  const csv=lines.map(l=>l.join(",")).join("\\n");
-  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download="expenses_categorized.csv";a.click();
-}
-window.addEventListener('load',loadExample);
-</script>
-</body></html>
-"""
+@app.get("/favicon.ico")
+def favicon():
+    # inline ₹ emoji favicon so the browser stops 404-ing
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+           '<rect width="100" height="100" rx="22" fill="#0f766e"/>'
+           '<text x="50" y="72" font-size="64" text-anchor="middle" fill="#fff" '
+           'font-family="Arial">₹</text></svg>')
+    from fastapi.responses import Response
+    return Response(svg, media_type="image/svg+xml")
 
 
 if __name__ == "__main__":

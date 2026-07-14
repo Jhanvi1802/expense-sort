@@ -10,6 +10,37 @@ import io
 import re
 
 DATE = re.compile(r"(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})")
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def _iso_date(s):
+    """Best-effort convert a matched date string to ISO yyyy-mm-dd (or None)."""
+    if not s:
+        return None
+    s = s.strip()
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", s)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000
+        if mo > 12 and d <= 12:      # tolerate mm/dd order
+            d, mo = mo, d
+        try:
+            return f"{y:04d}-{mo:02d}-{min(d,28):02d}"
+        except Exception:
+            return None
+    m = re.fullmatch(r"(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{2,4})", s)
+    if m:
+        mo = _MONTHS.get(m.group(2)[:3].lower())
+        if mo:
+            y = int(m.group(3))
+            y += 2000 if y < 100 else 0
+            return f"{y:04d}-{mo:02d}-{min(int(m.group(1)),28):02d}"
+    return None
 DEC = re.compile(r"\d{1,3}(?:,\d{2,3})*\.\d{2}")          # money, e.g. 1,60,000.00
 GEN = re.compile(r"(?:rs\.?|inr|₹)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.I)
 CRDR = re.compile(r"\b(cr|dr)\b", re.I)
@@ -31,12 +62,14 @@ def looks_like_statement(text):
 def parse_bank_statement(text):
     rows, prev_bal = [], None
     for line in text.splitlines():
-        if not DATE.search(line):
+        dm = DATE.search(line)
+        if not dm:
             continue
         amts = DEC.findall(line)
         if not amts:
             continue
 
+        iso = _iso_date(dm.group(0))
         desc = DATE.sub(" ", line)
         for a in amts:
             desc = desc.replace(a, " ", 1)
@@ -62,7 +95,9 @@ def parse_bank_statement(text):
             prev_bal = bal
 
         if desc and txn > 0:
-            rows.append({"description": desc, "amount": round(txn, 2), "direction": direction})
+            rows.append({"description": desc, "amount": round(txn, 2),
+                         "direction": direction, "date": iso,
+                         "balance": round(bal, 2) if bal is not None else None})
     return rows
 
 
@@ -82,11 +117,12 @@ def _parse_simple(text):
             parts = [p.strip() for p in parts if p.strip()]
             if not parts:
                 continue
-            amount, desc_parts = 0.0, []
+            amount, desc_parts, date = 0.0, [], None
             for p in parts:
                 if re.fullmatch(r"(?:rs\.?|inr|₹)?\s*[0-9][0-9,]*(?:\.[0-9]+)?", p, re.I):
                     amount = _amount_from(p)
                 elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", p) or re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", p):
+                    date = _iso_date(p)
                     continue
                 else:
                     desc_parts.append(p)
@@ -94,13 +130,15 @@ def _parse_simple(text):
             if not amount:
                 amount = _amount_from(" ".join(parts))
             if desc:
-                rows.append({"description": desc, "amount": amount, "direction": None})
+                rows.append({"description": desc, "amount": amount, "direction": None, "date": date})
         if rows:
             return rows
     for line in text.splitlines():
         line = line.strip()
         if line:
-            rows.append({"description": _strip_amount(line) or line, "amount": _amount_from(line), "direction": None})
+            dm = DATE.search(line)
+            rows.append({"description": _strip_amount(line) or line, "amount": _amount_from(line),
+                         "direction": None, "date": _iso_date(dm.group(0)) if dm else None})
     return rows
 
 

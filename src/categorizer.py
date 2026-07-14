@@ -44,6 +44,13 @@ def _compact(s):
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
+def merchant_key(desc):
+    """Stable key that collapses varying amounts/refs to the same merchant,
+    so 'Swiggy order 320' and 'SWIGGY-ORDER 540' group together."""
+    c = re.sub(r"\d+", "", _compact(desc))
+    return c[:24] or "unknown"
+
+
 def categorize_one(desc):
     if re.search(r"\brent\b", desc or "", re.I):   # "…109 RENT", "monthly rent"
         return "Rent", 1.0

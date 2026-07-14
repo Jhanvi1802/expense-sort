@@ -5,3 +5,16 @@ __pycache__/
 venv/
 ui_preview.png
 sample_statement.html
+
+# local database — contains user accounts + password hashes, never commit
+*.db
+expensesort.db
+
+# real/personal bank statements — never commit (use sample_statement.pdf instead)
+Acct Statement_*.pdf
+
+# test scaffolding
+node_modules/
+package.json
+package-lock.json
+shots/
